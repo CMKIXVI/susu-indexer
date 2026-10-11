@@ -3,18 +3,23 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { IndexerDb } from '../supabase/functions/_shared/db.ts';
 import { deriveGroupState } from '../supabase/functions/_shared/state.ts';
 
-Deno.test('readGroupFacts pages through contributions exceeding PostgREST cap and derives correct total', async () => {
+Deno.test('readGroupFacts pages through contributions with stable ordering and derives correct total', async () => {
   const contractId = 'C0000000000000000000000000000000000000000000000000000001';
   const TOTAL_CONTRIBUTIONS = 2500;
-  const CONTRIBUTION_AMOUNT = '10000000'; // 10 USDC in stroops (7 decimals)
+  const CONTRIBUTION_AMOUNT = '1000000';
 
   const mockContributions = Array.from({ length: TOTAL_CONTRIBUTIONS }, (_, i) => ({
     contract_id: contractId,
+    event_identity: `event-${String(i).padStart(4, '0')}`,
     round: (i % 10) + 1,
     amount: CONTRIBUTION_AMOUNT,
   }));
 
+  // Simulate a database that does not return rows in insertion order. The
+  // production query must establish a deterministic order before range().
+  const storageRows = [...mockContributions].reverse();
   const recordedRanges: { table: string; from: number; to: number }[] = [];
+  const recordedOrders: { table: string; column: string; ascending: boolean }[] = [];
 
   const stubClient = {
     from(table: string) {
@@ -24,16 +29,25 @@ Deno.test('readGroupFacts pages through contributions exceeding PostgREST cap an
             in(column: string, values: readonly string[]) {
               assertEquals(column, 'contract_id');
               assertEquals(values.includes(contractId), true);
-              return {
+              const query = {
+                order(column: string, options?: { ascending?: boolean }) {
+                  recordedOrders.push({
+                    table,
+                    column,
+                    ascending: options?.ascending ?? true,
+                  });
+                  return query;
+                },
                 range(from: number, to: number) {
                   recordedRanges.push({ table, from, to });
                   if (table === 'contributions') {
-                    const page = mockContributions.slice(from, to + 1);
+                    const page = storageRows.slice(from, to + 1);
                     return Promise.resolve({ data: page, error: null });
                   }
                   return Promise.resolve({ data: [], error: null });
                 },
               };
+              return query;
             },
           };
         },
@@ -42,16 +56,29 @@ Deno.test('readGroupFacts pages through contributions exceeding PostgREST cap an
   } as unknown as SupabaseClient;
 
   const db = new IndexerDb('https://example.supabase.co', 'dummy-key', stubClient);
-
-  // Read facts using default PostgREST cap of 1000
   const factsMap = await db.readGroupFacts([contractId], 1000);
   const facts = factsMap.get(contractId);
   if (!facts) throw new Error('facts missing for group');
 
-  // Acceptance Criterion: A paged-stub test asserts all rows are read
   assertEquals(facts.contributions.length, TOTAL_CONTRIBUTIONS);
 
-  // Range calls for contributions: 0-999, 1000-1999, 2000-2999
+  // Every paged table must establish a deterministic key before range().
+  assertEquals(
+    recordedOrders,
+    [
+      { table: 'group_members', column: 'contract_id', ascending: true },
+      { table: 'group_members', column: 'member', ascending: true },
+      { table: 'contributions', column: 'contract_id', ascending: true },
+      { table: 'contributions', column: 'event_identity', ascending: true },
+      { table: 'payouts', column: 'contract_id', ascending: true },
+      { table: 'payouts', column: 'event_identity', ascending: true },
+      { table: 'protocol_fees', column: 'contract_id', ascending: true },
+      { table: 'protocol_fees', column: 'event_identity', ascending: true },
+      { table: 'decoded_events', column: 'contract_id', ascending: true },
+      { table: 'decoded_events', column: 'event_identity', ascending: true },
+    ],
+  );
+
   const contribRanges = recordedRanges.filter((r) => r.table === 'contributions');
   assertEquals(contribRanges, [
     { table: 'contributions', from: 0, to: 999 },
@@ -59,11 +86,10 @@ Deno.test('readGroupFacts pages through contributions exceeding PostgREST cap an
     { table: 'contributions', from: 2000, to: 2999 },
   ]);
 
-  // Acceptance Criterion: A group with more contributions than the PostgREST cap derives the correct total
   const derived = deriveGroupState(contractId, facts);
   const expectedTotal = (BigInt(TOTAL_CONTRIBUTIONS) * BigInt(CONTRIBUTION_AMOUNT)).toString();
   assertEquals(derived.contributed_total, expectedTotal);
-  assertEquals(derived.contributed_total, '25000000000');
+  assertEquals(derived.contributed_total, '2500000000');
 });
 
 Deno.test('readGroupFacts chunks large contract_id list to avoid exceeding URL limits', async () => {
@@ -83,6 +109,13 @@ Deno.test('readGroupFacts chunks large contract_id list to avoid exceeding URL l
             in(_column: string, values: readonly string[]) {
               chunkedIdsRequested.push({ table, values: [...values] });
               return {
+                order() {
+                  return {
+                    range(_from: number, _to: number) {
+                      return Promise.resolve({ data: [], error: null });
+                    },
+                  };
+                },
                 range(_from: number, _to: number) {
                   return Promise.resolve({ data: [], error: null });
                 },
@@ -97,11 +130,7 @@ Deno.test('readGroupFacts chunks large contract_id list to avoid exceeding URL l
   const db = new IndexerDb('https://example.supabase.co', 'dummy-key', stubClient);
   await db.readGroupFacts(contractIds);
 
-  // Each table query chunks contractIds into chunks <= 100
-  // With 250 contracts: each table should see chunks of 100, 100, 50
-  for (const entry of chunkedIdsRequested) {
-    assertEquals(entry.values.length <= 100, true);
-  }
+  for (const entry of chunkedIdsRequested) assertEquals(entry.values.length <= 100, true);
 
   const memberChunks = chunkedIdsRequested
     .filter((e) => e.table === 'group_members')
@@ -117,7 +146,6 @@ Deno.test('readGroupFacts fails loudly if query hits server cap without paginati
         select(_columns: string) {
           return {
             in(_column: string, _values: readonly string[]) {
-              // Return 1000 rows without .range() method
               const fullCapData = Array.from({ length: 1000 }, () => ({
                 contract_id: contractId,
                 round: 1,
@@ -163,6 +191,15 @@ Deno.test('readGroupState pages through stored group rows exceeding page size', 
           return {
             in(_column: string, _values: readonly string[]) {
               return {
+                order() {
+                  return {
+                    range(from: number, to: number) {
+                      recordedRanges.push({ from, to });
+                      const page = mockGroups.slice(from, to + 1);
+                      return Promise.resolve({ data: page, error: null });
+                    },
+                  };
+                },
                 range(from: number, to: number) {
                   recordedRanges.push({ from, to });
                   const page = mockGroups.slice(from, to + 1);
